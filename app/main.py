@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, db, service
+from .pedigree import PedigreeError
 from .service import SelectionError
 
 
@@ -104,10 +105,12 @@ def _batch_payload(conn, batch_id: str) -> dict:
         "selection_version": batch["selection_version"],
         "files": files,
         "dup_groups": groups,
+        "cohort_samples": [g["sample_name"] for g in groups],
         "unresolved_samples": unresolved,
         "ready_to_generate": bool(batch["valid"]) and not unresolved
         and sum(1 for f in files if f["valid"]) >= config.MIN_FILES,
         "latest_generation": _generation_payload(latest) if latest else None,
+        "pedigree_threshold": config.PEDIGREE_INCOMPATIBILITY_THRESHOLD,
     }
 
 
@@ -238,10 +241,28 @@ def download(batch_id: str):
     )
 
 
+@app.post("/api/batches/{batch_id}/pedigree")
+def pedigree_review(
+    batch_id: str,
+    father: str = Form(...),
+    mother: str = Form(...),
+    child: str = Form(...),
+):
+    """Run the trio Mendelian-incompatibility review on the current cohort VCF.
+
+    Refused with 409 when the latest generation is missing, not ``done`` or
+    tied to an outdated selection version: a stale cohort result must never
+    back a current quality-control conclusion.
+    """
+    try:
+        return service.run_pedigree_review(batch_id, father, mother, child)
+    except PedigreeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
 
 @app.get("/", response_class=HTMLResponse)
 def index():

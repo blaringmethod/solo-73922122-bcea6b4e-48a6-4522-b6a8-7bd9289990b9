@@ -126,6 +126,35 @@
   #toast.show { opacity: 1; }
   .muted { color: var(--muted); }
   .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+  .stale-box {
+    background: var(--warn-bg);
+    color: var(--warn);
+    border: 1px solid #f0d9b0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 10px 0;
+    font-size: 13px;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px;
+    margin: 10px 0;
+  }
+  .stat {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .stat .num { font-size: 20px; font-weight: 700; display: block; }
+  .stat .label { font-size: 12px; color: var(--muted); }
+  .stat.alert .num { color: var(--err); }
+  .stat.warn .num { color: var(--warn); }
+  .stat.ok .num { color: var(--ok); }
+  .trio-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0; }
+  .trio-row label { font-size: 13px; font-weight: 600; display: block; margin-bottom: 4px; }
+  .prob-high { color: var(--err); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -188,6 +217,59 @@
       </div>
       <div id="genStatus" class="hint"></div>
     </section>
+
+    <section class="card">
+      <h2>5. 家系遗传不相容核查（父亲 / 母亲 / 子代）</h2>
+      <p class="hint">
+        选择队列中三个不同样本。逐位点将每人 PL 按 10<sup>-PL/10</sup> 归一化，
+        枚举三人基因型组合，统计子代无法从父母各继承一条等位基因的概率；
+        概率 ≥ <span id="thresholdLabel">0.99</span> 的位点列入复核清单。
+        任一人 GT 缺失或 PL 缺项计入“不可判定”，不算作一致。
+      </p>
+      <div id="pedigreeStale" class="stale-box" hidden></div>
+      <div class="trio-row">
+        <div>
+          <label for="fatherSelect">父亲</label>
+          <select id="fatherSelect"></select>
+        </div>
+        <div>
+          <label for="motherSelect">母亲</label>
+          <select id="motherSelect"></select>
+        </div>
+        <div>
+          <label for="childSelect">子代</label>
+          <select id="childSelect"></select>
+        </div>
+      </div>
+      <div class="pill-row">
+        <button id="pedigreeBtn">开始家系核查</button>
+        <span id="pedigreeMsg" class="hint"></span>
+      </div>
+      <div id="pedigreeResult" hidden>
+        <div class="stat-grid" id="pedigreeStats"></div>
+        <h3 style="font-size:14px;margin:14px 0 8px;">需复核的遗传不相容位点</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>坐标</th><th>REF</th><th>ALT</th>
+              <th>父亲 GT</th><th>母亲 GT</th><th>子代 GT</th>
+              <th>不相容概率</th>
+            </tr>
+          </thead>
+          <tbody id="incompatibleBody"></tbody>
+        </table>
+        <h3 style="font-size:14px;margin:16px 0 8px;">不可判定位点（GT 缺失 / PL 缺项，不计一致）</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>坐标</th><th>原因</th>
+              <th>父亲 GT</th><th>母亲 GT</th><th>子代 GT</th>
+            </tr>
+          </thead>
+          <tbody id="undecidableBody"></tbody>
+        </table>
+      </div>
+    </section>
   </div>
 </main>
 
@@ -197,6 +279,8 @@
 const $ = (id) => document.getElementById(id);
 let batchId = null;
 let pollTimer = null;
+let pedigreeReport = null;
+let cohortSamples = [];
 
 function toast(msg) {
   const el = $("toast");
@@ -226,6 +310,11 @@ function genStatusLabel(status) {
 }
 
 function renderBatch(data) {
+  if (batchId !== data.id) {
+    pedigreeReport = null;
+    $("pedigreeResult").hidden = true;
+    $("pedigreeMsg").textContent = "";
+  }
   batchId = data.id;
   $("result").hidden = false;
 
@@ -314,6 +403,121 @@ function renderBatch(data) {
   } else {
     $("generateBtn").title = "";
   }
+
+  renderPedigreePanel(data);
+}
+
+function trioSelections() {
+  return {
+    father: $("fatherSelect").value,
+    mother: $("motherSelect").value,
+    child: $("childSelect").value,
+  };
+}
+
+function fillTrioOptions() {
+  const previous = pedigreeReport
+    ? { father: pedigreeReport.father, mother: pedigreeReport.mother, child: pedigreeReport.child }
+    : trioSelections();
+  const selects = [
+    ["fatherSelect", previous.father],
+    ["motherSelect", previous.mother],
+    ["childSelect", previous.child],
+  ];
+  for (const [selectId, preferred] of selects) {
+    const sel = $(selectId);
+    sel.innerHTML = `<option value="">— 请选择样本 —</option>` +
+      cohortSamples.map((name) =>
+        `<option value="${esc(name)}"${name === preferred ? " selected" : ""}>${esc(name)}</option>`
+      ).join("");
+  }
+}
+
+function updateTrioOptionAvailability() {
+  // The same sample cannot occupy two trio roles.
+  const chosen = trioSelections();
+  for (const selectId of ["fatherSelect", "motherSelect", "childSelect"]) {
+    const sel = $(selectId);
+    Array.from(sel.options).forEach((opt) => {
+      if (!opt.value) return;
+      const usedElsewhere = Object.entries(chosen).some(
+        ([otherId, value]) => otherId !== selectId.replace("Select", "") && value === opt.value
+      );
+      opt.disabled = usedElsewhere;
+    });
+  }
+}
+
+function renderPedigreePanel(data) {
+  cohortSamples = data.cohort_samples || [];
+  $("thresholdLabel").textContent = String(data.pedigree_threshold ?? 0.99);
+  fillTrioOptions();
+  updateTrioOptionAvailability();
+
+  const gen = data.latest_generation;
+  const currentVersion = data.selection_version;
+  const downloadable = !!(gen && gen.downloadable &&
+    gen.selection_version === currentVersion);
+
+  const staleBox = $("pedigreeStale");
+  let staleMessage = "";
+  if (!gen) {
+    staleMessage = "尚未生成队列 VCF，请先在第 4 步生成后再进行家系核查。";
+  } else if (gen.status === "done" && gen.selection_version !== currentVersion) {
+    staleMessage = "取用源选择已变更，队列结果已失效。本次质控结果不能显示为当前结论，请按当前选择重新生成队列 VCF 后再分析。";
+  } else if (gen.status !== "done") {
+    staleMessage = `最新队列 VCF 状态为“${genStatusLabel(gen.status)}”，请等待完成或重新生成后再进行家系核查。`;
+  } else if (!gen.downloadable) {
+    staleMessage = "当前选择对应的队列 VCF 文件缺失，请重新生成后再进行家系核查。";
+  }
+  staleBox.hidden = !staleMessage;
+  staleBox.textContent = staleMessage;
+  $("pedigreeBtn").disabled = !downloadable;
+
+  // A previous review is only a current conclusion while its generation
+  // version still matches the live selection version.
+  if (pedigreeReport && pedigreeReport.selection_version !== currentVersion) {
+    pedigreeReport = null;
+    $("pedigreeResult").hidden = true;
+    $("pedigreeMsg").textContent = "取用源已变更，旧家系核查结论已失效，需重新生成后再分析。";
+  }
+}
+
+function renderPedigreeReport(report) {
+  pedigreeReport = report;
+  $("pedigreeResult").hidden = false;
+  $("pedigreeMsg").textContent =
+    `核查基于选择版本 ${report.selection_version} 的队列 VCF（阈值 ${report.threshold}）`;
+
+  $("pedigreeStats").innerHTML = `
+    <div class="stat"><span class="num">${report.total_sites}</span><span class="label">总位点数</span></div>
+    <div class="stat ok"><span class="num">${report.consistent_sites}</span><span class="label">相容位点数</span></div>
+    <div class="stat alert"><span class="num">${report.incompatible_count}</span><span class="label">需复核不相容位点（≥${report.threshold}）</span></div>
+    <div class="stat warn"><span class="num">${report.undecidable_count}</span><span class="label">不可判定位点（不计一致）</span></div>`;
+
+  $("incompatibleBody").innerHTML = report.incompatible_sites.length
+    ? report.incompatible_sites.map((s) => `
+      <tr>
+        <td class="mono">${esc(s.chrom)}:${s.pos}</td>
+        <td class="mono">${esc(s.ref)}</td>
+        <td class="mono">${esc((s.alts || []).join(","))}</td>
+        <td class="mono">${esc(s.father_gt)}</td>
+        <td class="mono">${esc(s.mother_gt)}</td>
+        <td class="mono">${esc(s.child_gt)}</td>
+        <td class="mono prob-high">${s.incompatibility_probability.toFixed(6)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="7" class="muted">无达到阈值的不相容位点</td></tr>`;
+
+  $("undecidableBody").innerHTML = report.undecidable_sites.length
+    ? report.undecidable_sites.map((s) => `
+      <tr>
+        <td class="mono">${esc(s.chrom)}:${s.pos}</td>
+        <td>${esc(s.reason)}</td>
+        <td class="mono">${esc(s.father_gt)}</td>
+        <td class="mono">${esc(s.mother_gt)}</td>
+        <td class="mono">${esc(s.child_gt)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="5" class="muted">无不可判定位点</td></tr>`;
 }
 
 async function fetchBatch() {
@@ -390,6 +594,43 @@ $("downloadBtn").addEventListener("click", () => {
 });
 
 $("refreshBtn").addEventListener("click", fetchBatch);
+
+["fatherSelect", "motherSelect", "childSelect"].forEach((id) => {
+  $(id).addEventListener("change", updateTrioOptionAvailability);
+});
+
+$("pedigreeBtn").addEventListener("click", async () => {
+  const { father, mother, child } = trioSelections();
+  if (!father || !mother || !child) {
+    toast("请先为父亲、母亲、子代各选择一个样本");
+    return;
+  }
+  if (new Set([father, mother, child]).size !== 3) {
+    toast("三人必须选择不同的样本");
+    return;
+  }
+  const form = new FormData();
+  form.append("father", father);
+  form.append("mother", mother);
+  form.append("child", child);
+  $("pedigreeMsg").textContent = "家系核查计算中…";
+  try {
+    const resp = await fetch(`/api/batches/${batchId}/pedigree`, {
+      method: "POST",
+      body: form,
+    });
+    const payload = await resp.json();
+    if (!resp.ok) {
+      $("pedigreeMsg").textContent = "";
+      toast(payload.detail || "家系核查失败");
+      return;
+    }
+    renderPedigreeReport(payload);
+  } catch (err) {
+    $("pedigreeMsg").textContent = "";
+    toast("家系核查请求失败：" + err);
+  }
+});
 </script>
 </body>
 </html>

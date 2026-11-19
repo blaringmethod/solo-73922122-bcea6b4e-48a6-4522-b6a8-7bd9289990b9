@@ -26,6 +26,13 @@ REQUIRED_FORMAT_FIELDS = ("GT",)
 ALLELE_RE = __import__("re").compile(r"^[ACGT]+$")
 DIPLOID_PLOIDY = 2
 
+# Pedigree (trio) Mendelian incompatibility review.
+# A site is listed for manual review when the posterior probability of an
+# incompatible father-mother-child genotype combination reaches this value.
+PEDIGREE_INCOMPATIBILITY_THRESHOLD = float(
+    os.environ.get("VCF_PEDIGREE_THRESHOLD", "0.99")
+)
+
 # Generation status values.
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"

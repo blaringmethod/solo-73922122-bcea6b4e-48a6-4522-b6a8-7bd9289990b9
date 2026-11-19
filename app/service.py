@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import config, cross_check, db
 from .merge import MergeAborted, SampleSource, merge_vcfs
+from .pedigree import PedigreeError, review_trio
 from .validation import validate_vcf
 
 logger = logging.getLogger(__name__)
@@ -289,6 +290,78 @@ def _cleanup_invalid_outputs(batch_id: str) -> None:
 def _safe_remove(path: str | None) -> None:
     if not path:
         return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Pedigree (trio) review
+# --------------------------------------------------------------------------- #
+def run_pedigree_review(
+    batch_id: str, father: str, mother: str, child: str
+) -> dict:
+    """Run a trio incompatibility review against the *current* cohort VCF.
+
+    The review only runs on the latest generation when it is ``done`` and its
+    ``selection_version`` equals the batch's current version. If the source
+    selection changed after the cohort VCF was generated, the result is
+    stale and must not be presented as a current conclusion: the caller has
+    to regenerate before reviewing again.
+    """
+    with db.get_db() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            raise PedigreeError("批次不存在")
+
+        trio = (father, mother, child)
+        if len(set(trio)) != 3 or any(not name for name in trio):
+            raise PedigreeError("父亲、母亲、子代必须选择三个不同的样本")
+
+        cohort_samples = [g["sample_name"] for g in db.get_dup_groups(conn, batch_id)]
+        unknown = [name for name in trio if name not in cohort_samples]
+        if unknown:
+            raise PedigreeError("队列中不存在以下样本：" + "、".join(unknown))
+
+        latest = db.get_latest_generation(conn, batch_id)
+        current_version = batch["selection_version"]
+        if latest is None:
+            raise PedigreeError("尚无队列 VCF 生成结果，请先生成后再进行家系核查")
+        # Version mismatch takes priority: even a superseded (once completed)
+        # generation must surface the "selection changed, conclusion stale"
+        # reason rather than a generic not-finished message.
+        if latest["selection_version"] != current_version:
+            raise PedigreeError(
+                "取用源选择已变更，该队列结果已失效，本次质控结果不能作为"
+                "当前结论；请按当前选择重新生成队列 VCF 后再进行家系核查"
+            )
+        if latest["status"] != config.STATUS_DONE:
+            raise PedigreeError(
+                "最新队列 VCF 未处于已完成状态（可能已失效或生成失败），"
+                "请重新生成后再进行家系核查"
+            )
+        output_path = latest["output_path"]
+        if not output_path or not Path(output_path).is_file():
+            raise PedigreeError(
+                "当前选择对应的队列 VCF 文件不存在，请重新生成后再进行家系核查"
+            )
+        generation_id = latest["id"]
+        gen_version = latest["selection_version"]
+
+    report = review_trio(
+        output_path,
+        father=father,
+        mother=mother,
+        child=child,
+        selection_version=gen_version,
+        threshold=config.PEDIGREE_INCOMPATIBILITY_THRESHOLD,
+    )
+    payload = report.to_dict()
+    payload["batch_id"] = batch_id
+    payload["generation_id"] = generation_id
+    payload["cohort_samples"] = cohort_samples
+    return payload
     try:
         os.unlink(path)
     except FileNotFoundError:
